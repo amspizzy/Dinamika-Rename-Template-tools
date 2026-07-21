@@ -1,0 +1,13 @@
+google-genai==2.12.1
+openpyxl==3.1.5
+rapidfuzz==3.14.5
+pillow==12.3.0
+pillow-heif==1.4.0
+opencv-python-headless==5.0.0.93
+numpy==2.5.1
+playwright==1.61.0
+lxml==6.1.1
+streamlit==1.59.2
+pandas==3.0.3
+pytest==9.1.1
+imagehash==4.3.2

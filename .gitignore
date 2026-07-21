@@ -1,0 +1,10 @@
+.gemini_key
+.app_settings.json
+.venv/
+__pycache__/
+*.py[cod]
+
+input/
+output/
+
+.DS_Store
