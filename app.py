@@ -16,6 +16,7 @@ import zipfile
 import shutil
 import csv
 import json
+import base64
 
 from rapidfuzz import fuzz
 
@@ -23,6 +24,8 @@ import pandas as pd
 import streamlit as st
 from PIL import Image
 from pillow_heif import register_heif_opener
+
+import match_and_rename as mr
 
 import config
 
@@ -93,32 +96,137 @@ ensure_work_dirs()
 # ---------------------------------------------------------------- sidebar --
 st.sidebar.title("⚙️ Pengaturan")
 
-saved_key = load_saved_api_key()
 app_settings = load_app_settings()
-api_key_input = st.sidebar.text_input(
-    "Gemini API Key", value=saved_key, type="password",
-    help="Buat gratis di https://aistudio.google.com/apikey",
-)
-if st.sidebar.button("Simpan API Key"):
-    with open(KEY_FILE, "w", encoding="utf-8") as f:
-        f.write(api_key_input.strip())
-    os.environ["GEMINI_API_KEY"] = api_key_input.strip()
-    st.sidebar.success("Tersimpan.")
 
-gemini_model_options = getattr(config, "GEMINI_MODEL_OPTIONS", [config.GEMINI_MODEL])
-saved_model = app_settings.get("gemini_model", config.GEMINI_MODEL)
-if saved_model not in gemini_model_options:
-    saved_model = config.GEMINI_MODEL
-selected_model = st.sidebar.selectbox(
-    "Model Gemini",
-    options=gemini_model_options,
-    index=gemini_model_options.index(saved_model),
-    help="Kalau scan gagal karena model tidak tersedia, coba pilih model lain.",
+# ---- AI Backend selection ----
+saved_backend = app_settings.get("ai_backend", config.AI_BACKEND)
+backend_options = ["gemini", "local", "easyocr"]
+saved_index = backend_options.index(saved_backend) if saved_backend in backend_options else 0
+selected_backend = st.sidebar.radio(
+    "AI Backend",
+    options=backend_options,
+    index=saved_index,
+    format_func=lambda x: {
+        "gemini": "☁️ Gemini (cloud)",
+        "local": "💻 Local (EasyOCR + Qwen)",
+        "easyocr": "📷 EasyOCR (OCR Only)",
+    }.get(x, x),
+    help="Gemini: butuh API key & internet. Local: EasyOCR + Qwen via Ollama (100% offline). EasyOCR: OCR only, tanpa Qwen.",
 )
-config.GEMINI_MODEL = selected_model
-if selected_model != app_settings.get("gemini_model"):
-    app_settings["gemini_model"] = selected_model
+config.AI_BACKEND = selected_backend
+if selected_backend != app_settings.get("ai_backend"):
+    app_settings["ai_backend"] = selected_backend
     save_app_settings(app_settings)
+
+EASYOCR_LANG_OPTIONS = [
+    "en", "id", "en,id", "ms", "zh-cn", "ja", "ko", "th", "vi",
+    "ar", "hi", "fr", "de", "es", "pt", "it", "nl", "ru",
+]
+
+if selected_backend == "gemini":
+    gemini_model_options = getattr(config, "GEMINI_MODEL_OPTIONS", [config.GEMINI_MODEL])
+    saved_model = app_settings.get("gemini_model", config.GEMINI_MODEL)
+    if saved_model not in gemini_model_options:
+        saved_model = config.GEMINI_MODEL
+    selected_model = st.sidebar.selectbox(
+        "Model Gemini",
+        options=gemini_model_options,
+        index=gemini_model_options.index(saved_model),
+        help="Kalau scan gagal karena model tidak tersedia, coba pilih model lain.",
+    )
+    config.GEMINI_MODEL = selected_model
+    if selected_model != app_settings.get("gemini_model"):
+        app_settings["gemini_model"] = selected_model
+        save_app_settings(app_settings)
+elif selected_backend == "local":
+    saved_url = app_settings.get("ollama_url", config.OLLAMA_BASE_URL)
+    ollama_url = st.sidebar.text_input(
+        "Ollama URL", value=saved_url,
+        help="URL Ollama server, default: http://localhost:11434",
+    )
+    config.OLLAMA_BASE_URL = ollama_url
+    if ollama_url != app_settings.get("ollama_url"):
+        app_settings["ollama_url"] = ollama_url
+        save_app_settings(app_settings)
+
+    saved_model = app_settings.get("ollama_model", config.OLLAMA_MODEL)
+    ollama_options = getattr(config, "OLLAMA_MODEL_OPTIONS", [config.OLLAMA_MODEL])
+    if saved_model not in ollama_options:
+        ollama_options = [saved_model] + ollama_options
+    ollama_model = st.sidebar.selectbox(
+        "Model Vision",
+        options=ollama_options,
+        index=ollama_options.index(saved_model) if saved_model in ollama_options else 0,
+        help="Pilih model Ollama vision. qwen3-vl:2b paling cepat, 8b lebih akurat.",
+    )
+    config.OLLAMA_MODEL = ollama_model
+    if ollama_model != app_settings.get("ollama_model"):
+        app_settings["ollama_model"] = ollama_model
+        save_app_settings(app_settings)
+
+    saved_langs = app_settings.get("easyocr_languages", config.EASYOCR_LANGUAGES)
+    if isinstance(saved_langs, list):
+        saved_langs = ",".join(saved_langs)
+    if saved_langs not in EASYOCR_LANG_OPTIONS:
+        saved_langs = config.EASYOCR_LANGUAGES
+        if isinstance(saved_langs, list):
+            saved_langs = ",".join(saved_langs)
+    selected_langs = st.sidebar.selectbox(
+        "Bahasa OCR",
+        options=EASYOCR_LANG_OPTIONS,
+        index=EASYOCR_LANG_OPTIONS.index(saved_langs) if saved_langs in EASYOCR_LANG_OPTIONS else 0,
+    )
+    config.EASYOCR_LANGUAGES = [l.strip() for l in selected_langs.split(",") if l.strip()]
+    if selected_langs != app_settings.get("easyocr_languages", ""):
+        app_settings["easyocr_languages"] = selected_langs
+        save_app_settings(app_settings)
+
+    saved_gpu = app_settings.get("easyocr_gpu", config.EASYOCR_GPU)
+    easyocr_gpu = st.sidebar.checkbox("Gunakan GPU", value=saved_gpu,
+                                       help="GPU/CUDA mempercepat OCR. Uncheck untuk CPU.")
+    config.EASYOCR_GPU = easyocr_gpu
+    if easyocr_gpu != app_settings.get("easyocr_gpu"):
+        app_settings["easyocr_gpu"] = easyocr_gpu
+        save_app_settings(app_settings)
+else:  # easyocr
+    saved_langs = app_settings.get("easyocr_languages", config.EASYOCR_LANGUAGES)
+    if isinstance(saved_langs, list):
+        saved_langs = ",".join(saved_langs)
+    if saved_langs not in EASYOCR_LANG_OPTIONS:
+        saved_langs = config.EASYOCR_LANGUAGES
+        if isinstance(saved_langs, list):
+            saved_langs = ",".join(saved_langs)
+    selected_langs = st.sidebar.selectbox(
+        "Bahasa OCR",
+        options=EASYOCR_LANG_OPTIONS,
+        index=EASYOCR_LANG_OPTIONS.index(saved_langs) if saved_langs in EASYOCR_LANG_OPTIONS else 0,
+    )
+    config.EASYOCR_LANGUAGES = [l.strip() for l in selected_langs.split(",") if l.strip()]
+    if selected_langs != app_settings.get("easyocr_languages", ""):
+        app_settings["easyocr_languages"] = selected_langs
+        save_app_settings(app_settings)
+
+    saved_gpu = app_settings.get("easyocr_gpu", config.EASYOCR_GPU)
+    easyocr_gpu = st.sidebar.checkbox("Gunakan GPU", value=saved_gpu,
+                                       help="GPU/CUDA mempercepat OCR. Uncheck untuk CPU.")
+    config.EASYOCR_GPU = easyocr_gpu
+    if easyocr_gpu != app_settings.get("easyocr_gpu"):
+        app_settings["easyocr_gpu"] = easyocr_gpu
+        save_app_settings(app_settings)
+
+    st.sidebar.caption("EasyOCR akan di-load sekali saat scan pertama (1-2 menit).")
+
+if selected_backend == "gemini":
+    saved_key = load_saved_api_key()
+    api_key_input = st.sidebar.text_input(
+        "Gemini API Key", value=saved_key, type="password",
+        help="Buat gratis di https://aistudio.google.com/apikey. Diperlukan untuk Gemini (cloud) maupun OCR di local backend.",
+    )
+    if st.sidebar.button("Simpan API Key"):
+        with open(KEY_FILE, "w", encoding="utf-8") as f:
+            f.write(api_key_input.strip())
+        os.environ["GEMINI_API_KEY"] = api_key_input.strip()
+        st.sidebar.success("Tersimpan.")
 
 st.sidebar.divider()
 st.sidebar.caption(f"Database: `{os.path.basename(config.DATABASE_XLSX)}`")
@@ -217,24 +325,50 @@ with tab1:
 
     st.divider()
 
-    disabled = not os.environ.get("GEMINI_API_KEY") or not new_files
-    if not os.environ.get("GEMINI_API_KEY"):
-        st.warning("Isi & simpan Gemini API Key dulu di sidebar kiri.")
+    use_local = config.AI_BACKEND == "local"
+    use_easyocr = config.AI_BACKEND == "easyocr"
+    if use_easyocr:
+        can_scan = bool(new_files)
+        st.caption("📷 EasyOCR — 100% offline OCR + fuzzy match. Tanpa internet.")
+    elif use_local:
+        can_scan = bool(new_files)
+        st.caption("💻 Local — EasyOCR + Qwen vision via Ollama. 100% offline.")
+    else:
+        can_scan = bool(os.environ.get("GEMINI_API_KEY")) and bool(new_files)
+        if not os.environ.get("GEMINI_API_KEY"):
+            st.warning("Isi & simpan Gemini API Key dulu di sidebar kiri.")
 
-    if st.button("🔍 Scan & Cocokkan Semua Foto", type="primary", disabled=disabled):
+    if st.button("🔍 Scan & Cocokkan Semua Foto", type="primary", disabled=not can_scan):
         if not new_files:
             st.info("Tidak ada foto baru yang perlu di-scan.")
             st.rerun()
 
-        import match_and_rename as mr
-
-        from google import genai
-
-        client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
+        client = None
+        backend_config = None
+        if use_easyocr:
+            backend_config = {
+                "type": "easyocr",
+                "easyocr_languages": config.EASYOCR_LANGUAGES,
+                "easyocr_gpu": config.EASYOCR_GPU,
+            }
+        elif use_local:
+            backend_config = {
+                "type": "local",
+                "ollama_url": config.OLLAMA_BASE_URL,
+                "ollama_model": config.OLLAMA_MODEL,
+                "easyocr_languages": config.EASYOCR_LANGUAGES,
+                "easyocr_gpu": config.EASYOCR_GPU,
+            }
+        else:
+            from google import genai
+            client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
         db_rows = mr.load_database()
         sku_set = {str(r["sku"]) for r in db_rows}
         hash_cache = mr.load_hash_cache()
+        ref_hash_map = mr.compute_reference_hashes()
         st.write(f"Database dimuat: **{len(db_rows)}** SKU aktif.")
+        if ref_hash_map:
+            st.caption(f"Referensi visual: {len(ref_hash_map)} SKU dari katalog")
 
         os.makedirs(os.path.dirname(config.REPORT_CSV), exist_ok=True)
 
@@ -288,11 +422,12 @@ with tab1:
                 ai_raw = json.dumps({"match_method": fn_method}, ensure_ascii=False)
             else:
                 vh_sku, vh_score = mr.match_by_visual_hash(path, hash_cache)
+                input_hash = mr.compute_image_hash(path)
 
-                if i > 0:
+                if i > 0 and not (use_local or use_easyocr):
                     time.sleep(config.SCAN_DELAY_SECONDS)
                 try:
-                    ai_result = mr.analyze_image_with_ai(client, path)
+                    ai_result = mr.analyze_image(path, client, backend_config)
                 except Exception as e:
                     review_path = mr.unique_dest_path(config.INPUT_REVIEW_DIR, fname)
                     shutil.move(path, review_path)
@@ -301,27 +436,41 @@ with tab1:
                     continue
 
                 vh_bonus = vh_score if vh_sku else 0
-                row, score = mr.match_to_database(ai_result, db_rows, vh_bonus, vh_sku)
+                row, score = mr.match_to_database(ai_result, db_rows, vh_bonus, vh_sku,
+                                                  ref_hash_map, input_hash)
                 ai_raw = json.dumps(ai_result, ensure_ascii=False)
 
                 sorted_candidates = []
+                ocr_text = ai_result.get("extracted_text", "") or ""
+                brand_guess = (ai_result.get("brand") or "").lower()
+                if not brand_guess and ocr_text:
+                    for r in db_rows:
+                        rb = (r.get("brand") or "").lower().strip()
+                        if rb and rb in ocr_text.lower():
+                            brand_guess = rb
+                            break
                 ai_category = (ai_result.get("category_guess") or "").lower().strip()
+                if not ai_category and ocr_text:
+                    ocr_lower = ocr_text.lower()
+                    for r in db_rows:
+                        rc = (r.get("category") or "").lower().strip()
+                        if rc and rc in ocr_lower:
+                            ai_category = rc
+                            break
                 for r in db_rows:
                     s = 0.0
-                    size_norm = mr.normalize_size(ai_result.get("size") or ai_result.get("extracted_text", ""))
+                    size_norm = mr.normalize_size(ai_result.get("size") or ocr_text)
                     if size_norm and mr.normalize_size(r["size"]) == size_norm:
                         s += config.SIZE_EXACT_BONUS
-                    brand_guess = (ai_result.get("brand") or "").lower()
                     if brand_guess and r["brand"]:
                         s += (fuzz.partial_ratio(brand_guess, r["brand"].lower()) / 100) * config.BRAND_WEIGHT
                     text_blob = " ".join(filter(None, [
                         ai_result.get("category_guess", ""),
                         ai_result.get("visual_description", ""),
-                        ai_result.get("extracted_text", ""),
+                        ocr_text,
                     ])).lower()
                     candidates_text = f"{r['vision_keywords']} {r['ocr_keywords']} {r['description']} {r['category']}".lower()
                     s += (fuzz.token_set_ratio(text_blob, candidates_text) / 100) * config.TEXT_MATCH_WEIGHT
-                    # category match / mismatch
                     db_category = (r.get("category") or "").lower().strip()
                     if ai_category and db_category:
                         cat_ratio = fuzz.ratio(ai_category, db_category)
@@ -331,26 +480,50 @@ with tab1:
                             s -= config.CATEGORY_MISMATCH_PENALTY
                     if vh_sku and str(r["sku"]) == str(vh_sku):
                         s += min(vh_bonus, config.VISUAL_HASH_WEIGHT)
+                    if input_hash and ref_hash_map:
+                        sku_str = str(r["sku"])
+                        if sku_str in ref_hash_map:
+                            import imagehash
+                            try:
+                                ref_h = imagehash.hex_to_hash(ref_hash_map[sku_str])
+                                dist = imagehash.hex_to_hash(input_hash) - ref_h
+                                bonus = max(0, config.REF_VISUAL_WEIGHT - dist)
+                                s += min(bonus, config.REF_VISUAL_WEIGHT)
+                            except Exception:
+                                pass
                     sorted_candidates.append((r, round(s, 1)))
                 sorted_candidates.sort(key=lambda x: x[1], reverse=True)
 
                 if (len(sorted_candidates) >= 2
                         and sorted_candidates[0][1] - sorted_candidates[1][1] < config.VISUAL_AMBIGUITY_GAP
                         and sorted_candidates[0][1] >= config.MIN_MATCH_SCORE):
-                    top_skus = [sorted_candidates[0][0], sorted_candidates[1][0]]
+                    top_skus = [c[0] for c in sorted_candidates[:5]]
                     ref_paths = []
+                    valid_top_skus = []
                     for ts in top_skus:
                         ts_sku = str(ts["sku"])
-                        ref_path = os.path.join(config.RENAMED_DIR, ts["output_folder"], f"{ts_sku}.jpg")
-                        if os.path.exists(ref_path):
+                        ref_path = None
+                        cat_jpg = os.path.join(config.CATALOG_REF_DIR, f"{ts_sku}.jpg")
+                        cat_png = os.path.join(config.CATALOG_REF_DIR, f"{ts_sku}.png")
+                        
+                        if os.path.exists(cat_jpg):
+                            ref_path = cat_jpg
+                        elif os.path.exists(cat_png):
+                            ref_path = cat_png
+                        else:
+                            # fallback to hash cache / renamed folder
+                            ref_path = os.path.join(config.RENAMED_DIR, ts["output_folder"], f"{ts_sku}.jpg")
+                            
+                        if ref_path and os.path.exists(ref_path):
                             ref_paths.append(ref_path)
-                    if ref_paths:
-                        best_idx = mr.compare_with_gemini(client, path, ref_paths)
-                        if best_idx >= 0:
-                            chosen = top_skus[best_idx]
+                            valid_top_skus.append(ts)
+                            
+                    if len(ref_paths) >= 2:
+                        best_idx = mr.compare_images(path, ref_paths, client, backend_config)
+                        if best_idx >= 0 and best_idx < len(valid_top_skus):
+                            chosen = valid_top_skus[best_idx]
                             row = chosen
-                            score = sorted_candidates[best_idx][1]
-
+                            score = sorted_candidates[0][1] + 10
                 if row and score >= config.MIN_MATCH_SCORE:
                     status = "OK"
                     sku = row["sku"]
@@ -396,7 +569,8 @@ with tab1:
 
     if os.path.exists(config.REPORT_CSV):
         st.subheader("Hasil pencocokan terakhir")
-        df = pd.read_csv(config.REPORT_CSV)
+        df = pd.read_csv(config.REPORT_CSV, dtype={"primary": str})
+        df["primary"] = df["primary"].fillna("")
         n_ok = (df["status"] == "OK").sum()
         n_review = (df["status"] == "REVIEW").sum()
         n_err = (df["status"] == "ERROR").sum()
@@ -405,71 +579,86 @@ with tab1:
         c2.metric("⚠️ Perlu review", n_review)
         c3.metric("❌ Error", n_err)
 
-        show_cols = ["original_filename", "matched_sku", "description", "score", "status", "primary"]
-        st.dataframe(df[show_cols], width='stretch', hide_index=True)
+        db_rows = mr.load_database()
+        sku_list = set(str(r["sku"]) for r in db_rows if r.get("sku"))
+        existing_skus = set(str(s) for s in df["matched_sku"].dropna().unique() if str(s).strip())
+        sku_list = sorted(sku_list | existing_skus)
+        sku_map = {str(r["sku"]): r for r in db_rows}
 
-        if n_review > 0:
-            st.warning(
-                f"{n_review} foto skornya rendah, tersimpan di "
-                f"`output/renamed/_perlu_review/` — pilih SKU manual di bawah "
-                f"biar bisa ikut generate template."
-            )
+        def _img_preview(path):
+            if not pd.notna(path) or not os.path.exists(str(path)):
+                return None
+            try:
+                with open(path, "rb") as f:
+                    data = f.read()
+                ext = os.path.splitext(str(path))[1].lower()
+                mime = {"jpg": "image/jpeg", "jpeg": "image/jpeg", "png": "image/png", "webp": "image/webp"}.get(ext.lstrip("."), "image/jpeg")
+                return f"data:{mime};base64,{base64.b64encode(data).decode()}"
+            except Exception:
+                return None
 
-            import match_and_rename as mr
-            db_rows = mr.load_database()
-            sku_options = {f"{r['sku']} — {r['description']}": r for r in db_rows}
+        df["_preview"] = df["final_path"].apply(_img_preview)
+        show_cols = ["_preview", "original_filename", "matched_sku", "description", "score", "status"]
+        edited_df = st.data_editor(
+            df[show_cols],
+            column_config={
+                "_preview": st.column_config.ImageColumn("Foto", width="small"),
+                "original_filename": st.column_config.TextColumn("File", disabled=True),
+                "matched_sku": st.column_config.SelectboxColumn("SKU", options=sku_list),
+                "description": st.column_config.TextColumn("Deskripsi", disabled=True),
+                "score": st.column_config.NumberColumn("Skor", disabled=True),
+                "status": st.column_config.TextColumn("Status", disabled=True),
+            },
+            hide_index=True,
+            width='stretch',
+            key="sku_editor",
+        )
 
-            st.subheader("Reassign foto REVIEW ke SKU")
-            review_df = df[df["status"] == "REVIEW"].reset_index(drop=True)
-            selections = {}
-            for idx, row in review_df.iterrows():
-                fname = row["original_filename"]
-                src_path = row.get("final_path", "")
-                c1, c2 = st.columns([1, 3])
-                with c1:
-                    if src_path and os.path.exists(str(src_path)):
-                        st.image(str(src_path), caption=fname, width=200)
-                    else:
-                        st.caption(fname)
-                with c2:
-                    label = st.selectbox(
-                        f"Pilih SKU untuk **{fname}**",
-                        options=["—"] + list(sku_options.keys()),
-                        key=f"review_sku_{idx}",
-                    )
-                    selections[fname] = (label, src_path)
+        if st.button("Simpan Perubahan SKU", type="primary"):
+            changed_mask = edited_df["matched_sku"] != df["matched_sku"]
+            changed_idxs = edited_df.index[changed_mask].tolist()
 
-            if st.button("Terapkan Reassign", type="primary"):
+            if not changed_idxs:
+                st.info("Tidak ada perubahan SKU.")
+            else:
                 assigned = 0
-                for fname, (label, src_path) in selections.items():
-                    if label == "—" or not src_path or not os.path.exists(str(src_path)):
+                for idx in changed_idxs:
+                    fname = edited_df.loc[idx, "original_filename"]
+                    new_sku = edited_df.loc[idx, "matched_sku"]
+                    old_sku = df.loc[idx, "matched_sku"]
+                    if not new_sku or new_sku == old_sku:
                         continue
-                    chosen = sku_options[label]
-                    sku = chosen["sku"]
+                    chosen = sku_map.get(new_sku)
+                    if not chosen:
+                        continue
+
+                    src_path = df.loc[idx, "final_path"]
+                    if not src_path or not os.path.exists(str(src_path)):
+                        continue
+
                     ext = os.path.splitext(fname)[1] or ".jpg"
                     dest_folder = os.path.join(config.RENAMED_DIR, chosen["output_folder"])
-                    dest_path = mr.unique_dest_path(dest_folder, f"{sku}{ext}")
+                    dest_path = mr.unique_dest_path(dest_folder, f"{new_sku}{ext}")
+
                     shutil.copy2(str(src_path), dest_path)
                     os.remove(str(src_path))
-                    new_primary = "yes" if not any(
-                        r["matched_sku"] == sku and r["primary"] == "yes"
-                        for _, r in df.iterrows()
-                    ) else ""
 
-                    df.loc[df["original_filename"] == fname, "matched_sku"] = sku
-                    df.loc[df["original_filename"] == fname, "description"] = chosen["description"]
-                    df.loc[df["original_filename"] == fname, "score"] = 100
-                    df.loc[df["original_filename"] == fname, "status"] = "OK"
-                    df.loc[df["original_filename"] == fname, "final_path"] = dest_path
-                    df.loc[df["original_filename"] == fname, "primary"] = new_primary
+                    df.loc[idx, "matched_sku"] = new_sku
+                    df.loc[idx, "description"] = chosen["description"]
+                    df.loc[idx, "score"] = 100
+                    df.loc[idx, "status"] = "OK"
+                    df.loc[idx, "final_path"] = dest_path
                     assigned += 1
 
                 if assigned > 0:
+                    rows_list = df.values.tolist()
+                    mr.mark_primary_photo(rows_list)
+                    df = pd.DataFrame(rows_list, columns=df.columns)
                     df.to_csv(config.REPORT_CSV, index=False)
-                    st.success(f"{assigned} foto berhasil di-reassign ke SKU yang benar!")
+                    st.success(f"{assigned} foto berhasil di-update SKU-nya!")
                     st.rerun()
                 else:
-                    st.info("Tidak ada foto yang dipilih untuk di-reassign.")
+                    st.info("Tidak ada perubahan yang bisa diproses.")
 
 # =============================================================== TAB 2 =====
 with tab2:
@@ -478,7 +667,8 @@ with tab2:
     if not os.path.exists(config.REPORT_CSV):
         st.info("Scan foto dulu di tab pertama sebelum generate.")
     else:
-        df = pd.read_csv(config.REPORT_CSV)
+        df = pd.read_csv(config.REPORT_CSV, dtype={"primary": str})
+        df["primary"] = df["primary"].fillna("")
         ready_rows = df[(df["status"] == "OK") & (df["primary"] == "yes")]
         ready_rows = ready_rows.sort_values("score", ascending=False).drop_duplicates("matched_sku")
 

@@ -25,8 +25,6 @@ import openpyxl
 from PIL import Image, ImageOps
 from pillow_heif import register_heif_opener
 from rapidfuzz import fuzz
-from google import genai
-from google.genai import types
 
 import config
 
@@ -87,6 +85,8 @@ def compress_image(image_path, max_dim=1600, quality=80):
 def analyze_image_with_ai(client, image_path):
     """Kirim gambar ke Gemini vision, minta balikin JSON terstruktur.
     Ada retry otomatis untuk semua jenis error (rate limit, network, dll)."""
+    from google.genai import types
+
     img_bytes, media_type = compress_image(image_path)
 
     prompt = (
@@ -129,20 +129,53 @@ def analyze_image_with_ai(client, image_path):
     raise RuntimeError("Gagal setelah beberapa kali retry.")
 
 
-def match_to_database(ai_result, db_rows, visual_hash_bonus=0, visual_hash_sku=None):
+def match_to_database(ai_result, db_rows, visual_hash_bonus=0, visual_hash_sku=None,
+                      ref_hash_map=None, input_hash=None):
     """Cocokkan hasil analisa AI ke baris database, kembalikan (row, score, method).
     visual_hash_bonus = tambahan score dari visual hash match.
-    visual_hash_sku = SKU dari visual hash match."""
-    size_norm = normalize_size(ai_result.get("size") or ai_result.get("extracted_text", ""))
+    visual_hash_sku = SKU dari visual hash match.
+    ref_hash_map = {sku: hash_string} dari Catalog/reference_images/.
+    input_hash = hash string dari foto yang sedang diproses."""
+    import imagehash
+    ocr_text = ai_result.get("extracted_text", "") or ""
+
+    # Fallback: extract size/brand/category dari OCR text kalau AI vision null
+    size_norm = normalize_size(ai_result.get("size") or ocr_text)
+
     brand_guess = (ai_result.get("brand") or "").lower()
+    if not brand_guess and ocr_text:
+        for r in db_rows:
+            rb = (r.get("brand") or "").lower().strip()
+            if rb and rb in ocr_text.lower():
+                brand_guess = rb
+                break
+
     ai_category = (ai_result.get("category_guess") or "").lower().strip()
+    if not ai_category and ocr_text:
+        ocr_lower = ocr_text.lower()
+        for r in db_rows:
+            rc = (r.get("category") or "").lower().strip()
+            if rc and rc in ocr_lower:
+                ai_category = rc
+                break
     text_blob = " ".join(filter(None, [
         ai_result.get("category_guess", ""),
         ai_result.get("visual_description", ""),
         ai_result.get("extracted_text", ""),
     ])).lower()
 
+    # Direct SKU match: extracted_text mengandung SKU database secara exact (token-based)
+    tokens = set(re.findall(r'\S+', ocr_text.lower()))
+    direct_sku_rows = []
+    for r in db_rows:
+        sku_norm = str(r["sku"]).strip().lstrip("-").strip().lower()
+        if len(sku_norm) >= config.SKU_MATCH_MIN_LEN and sku_norm in tokens:
+            direct_sku_rows.append(r)
+    if len(direct_sku_rows) == 1:
+        return direct_sku_rows[0], 100
+
     best_row, best_score = None, -1
+    input_phash = imagehash.hex_to_hash(input_hash) if input_hash else None
     for row in db_rows:
         score = 0.0
         # 1) ukuran exact match -> bobot besar
@@ -165,6 +198,17 @@ def match_to_database(ai_result, db_rows, visual_hash_bonus=0, visual_hash_sku=N
         # 5) visual hash bonus (capped to VISUAL_HASH_WEIGHT)
         if visual_hash_sku and str(row["sku"]) == str(visual_hash_sku):
             score += min(visual_hash_bonus, config.VISUAL_HASH_WEIGHT)
+        # 6) reference visual bonus (capped to REF_VISUAL_WEIGHT)
+        if input_phash and ref_hash_map:
+            sku_str = str(row["sku"])
+            if sku_str in ref_hash_map:
+                try:
+                    ref_h = imagehash.hex_to_hash(ref_hash_map[sku_str])
+                    dist = input_phash - ref_h
+                    bonus = max(0, config.REF_VISUAL_WEIGHT - dist)
+                    score += min(bonus, config.REF_VISUAL_WEIGHT)
+                except Exception:
+                    pass
 
         if score > best_score:
             best_row, best_score = row, score
@@ -283,9 +327,31 @@ def add_to_hash_cache(hash_cache, sku, image_path):
         hash_cache[sku] = h
 
 
+def compute_reference_hashes():
+    """Compute perceptual hash untuk setiap gambar di Catalog/reference_images/.
+    Return dict {sku: hash_string}. Kalau folder kosong atau error, return {}."""
+    import imagehash
+    ref_dir = config.CATALOG_REF_DIR
+    if not os.path.isdir(ref_dir):
+        return {}
+    hashes = {}
+    for fname in os.listdir(ref_dir):
+        if fname.lower().endswith((".jpg", ".jpeg", ".png", ".webp")):
+            sku = os.path.splitext(fname)[0]
+            fpath = os.path.join(ref_dir, fname)
+            try:
+                img = ImageOps.exif_transpose(Image.open(fpath)).convert("RGB")
+                hashes[sku] = str(imagehash.phash(img))
+            except Exception:
+                continue
+    return hashes
+
+
 def compare_with_gemini(client, input_path, reference_paths):
     """Kirim foto baru + foto referensi ke Gemini, minta pilih mana yang paling mirip.
     Return index (0-based) foto paling mirip, atau -1 kalau gagal."""
+    from google.genai import types
+
     img_bytes, media_type = compress_image(input_path, max_dim=800, quality=70)
 
     ref_parts = []
@@ -329,22 +395,129 @@ def compare_with_gemini(client, input_path, reference_paths):
     return -1
 
 
-def main():
-    api_key = os.environ.get("GEMINI_API_KEY")
-    if not api_key:
-        print("ERROR: set dulu environment variable GEMINI_API_KEY sebelum jalanin script ini.")
-        print("Buat API key gratis di: https://aistudio.google.com/apikey")
-        print('Contoh (Mac/Linux): export GEMINI_API_KEY="xxxxxxxx"')
-        print('Contoh (Windows PowerShell): $env:GEMINI_API_KEY="xxxxxxxx"')
-        sys.exit(1)
+def gemini_ocr_only(client, image_path) -> str:
+    """Pakai Gemini cuma buat baca teks (OCR). Ringan, 1-2 detik."""
+    from google.genai import types
 
-    client = genai.Client(api_key=api_key)
+    img_bytes, media_type = compress_image(image_path, max_dim=1200, quality=70)
+    prompt = "Baca dan tuliskan SEMUA teks yang terlihat di gambar ini. Balas HANYA teksnya saja, tanpa komentar."
+    try:
+        resp = client.models.generate_content(
+            model=config.GEMINI_MODEL,
+            contents=[types.Part.from_bytes(data=img_bytes, mime_type=media_type), prompt],
+        )
+        return (resp.text or "").strip()
+    except Exception as e:
+        print(f"  Gemini OCR error: {e}")
+        return ""
+
+
+def analyze_image(image_path, client=None, backend_config=None):
+    """Router: panggil AI backend yang dipilih (gemini atau local).
+    backend_config: dict dengan key 'type', 'ollama_url', 'ollama_model'."""
+    backend = config.AI_BACKEND
+    if backend_config and "type" in backend_config:
+        backend = backend_config["type"]
+
+    if backend == "local":
+        import easyocr_ocr
+        import local_ai
+
+        base_url = config.OLLAMA_BASE_URL
+        model = config.OLLAMA_MODEL
+        languages = config.EASYOCR_LANGUAGES
+        gpu = config.EASYOCR_GPU
+        if backend_config:
+            base_url = backend_config.get("ollama_url", base_url)
+            model = backend_config.get("ollama_model", model)
+            languages = backend_config.get("easyocr_languages", languages)
+            gpu = backend_config.get("easyocr_gpu", gpu)
+
+        ocr_text = easyocr_ocr.extract_text(image_path, languages, gpu)
+        qwen_result = local_ai.analyze_image(image_path, base_url, model)
+
+        if "_error" in qwen_result and qwen_result["_error"]:
+            print(f"  Qwen error: {qwen_result['_error']}")
+            if ocr_text:
+                qwen_result["extracted_text"] = ocr_text
+            del qwen_result["_error"]
+            return qwen_result
+
+        qwen_result["extracted_text"] = ocr_text or qwen_result.get("extracted_text", "")
+        return qwen_result
+
+    if backend == "easyocr":
+        import easyocr_ocr
+
+        languages = config.EASYOCR_LANGUAGES
+        gpu = config.EASYOCR_GPU
+        if backend_config:
+            languages = backend_config.get("easyocr_languages", languages)
+            gpu = backend_config.get("easyocr_gpu", gpu)
+
+        text = easyocr_ocr.extract_text(image_path, languages, gpu)
+        return {
+            "extracted_text": text,
+            "brand": None,
+            "size": None,
+            "category_guess": "",
+            "visual_description": text,
+        }
+
+    if client is None:
+        raise ValueError("Gemini client required for gemini backend")
+    return analyze_image_with_ai(client, image_path)
+
+
+def compare_images(input_path, reference_paths, client=None, backend_config=None):
+    """Router: panggil visual compare sesuai backend yang dipilih."""
+    backend = config.AI_BACKEND
+    if backend_config and "type" in backend_config:
+        backend = backend_config["type"]
+
+    if backend == "local":
+        import local_ai
+        base_url = config.OLLAMA_BASE_URL
+        model = config.OLLAMA_MODEL
+        if backend_config:
+            base_url = backend_config.get("ollama_url", base_url)
+            model = backend_config.get("ollama_model", model)
+        return local_ai.compare_images(input_path, reference_paths, base_url, model)
+
+    if backend == "easyocr":
+        return -1
+
+    if client is None:
+        raise ValueError("Gemini client required for gemini backend")
+    return compare_with_gemini(client, input_path, reference_paths)
+
+
+def main():
+    use_local = config.AI_BACKEND == "local"
+    use_easyocr = config.AI_BACKEND == "easyocr"
+    client = None
+
+    if use_easyocr:
+        print("EasyOCR mode: 100% offline OCR + fuzzy match ke database")
+    elif use_local:
+        print(f"Local AI backend: EasyOCR + Qwen ({config.OLLAMA_MODEL})")
+    else:
+        api_key = os.environ.get("GEMINI_API_KEY")
+        if not api_key:
+            print("ERROR: set dulu environment variable GEMINI_API_KEY sebelum jalanin script ini.")
+            print("Buat API key gratis di: https://aistudio.google.com/apikey")
+            print('Contoh (Mac/Linux): export GEMINI_API_KEY="xxxxxxxx"')
+            print('Contoh (Windows PowerShell): $env:GEMINI_API_KEY="xxxxxxxx"')
+            sys.exit(1)
+        from google import genai
+        client = genai.Client(api_key=api_key)
     db_rows = load_database()
     print(f"Database dimuat: {len(db_rows)} SKU aktif.")
 
     os.makedirs(config.INPUT_DIR, exist_ok=True)
     os.makedirs(config.INPUT_DONE_DIR, exist_ok=True)
     os.makedirs(config.INPUT_REVIEW_DIR, exist_ok=True)
+    os.makedirs(config.CATALOG_REF_DIR, exist_ok=True)
 
     VALID_EXT = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".heic"}
     image_files = [
@@ -361,6 +534,9 @@ def main():
     report_rows = []
     sku_set = {str(r["sku"]) for r in db_rows}
     hash_cache = load_hash_cache()
+    ref_hash_map = compute_reference_hashes()
+    if ref_hash_map:
+        print(f"Reference hashes dimuat: {len(ref_hash_map)} SKU dari Catalog/reference_images/")
 
     for i, fname in enumerate(image_files):
         path = os.path.join(config.INPUT_DIR, fname)
@@ -397,11 +573,12 @@ def main():
             ai_raw = json.dumps({"match_method": fn_method}, ensure_ascii=False)
         else:
             vh_sku, vh_score = match_by_visual_hash(path, hash_cache)
+            input_hash = compute_image_hash(path)
 
-            if i > 0:
+            if i > 0 and not (use_local or use_easyocr):
                 time.sleep(config.SCAN_DELAY_SECONDS)
             try:
-                ai_result = analyze_image_with_ai(client, path)
+                ai_result = analyze_image(path, client)
             except Exception as e:
                 print(f"  gagal analisa AI: {e}")
                 review_path = unique_dest_path(config.INPUT_REVIEW_DIR, fname)
@@ -410,23 +587,38 @@ def main():
                 continue
 
             vh_bonus = vh_score if vh_sku else 0
-            row, score = match_to_database(ai_result, db_rows, vh_bonus, vh_sku)
+            row, score = match_to_database(ai_result, db_rows, vh_bonus, vh_sku,
+                                           ref_hash_map, input_hash)
             ai_raw = json.dumps(ai_result, ensure_ascii=False)
 
             sorted_candidates = []
+            ocr_text = ai_result.get("extracted_text", "") or ""
+            brand_guess = (ai_result.get("brand") or "").lower()
+            if not brand_guess and ocr_text:
+                for r in db_rows:
+                    rb = (r.get("brand") or "").lower().strip()
+                    if rb and rb in ocr_text.lower():
+                        brand_guess = rb
+                        break
             ai_category = (ai_result.get("category_guess") or "").lower().strip()
+            if not ai_category and ocr_text:
+                ocr_lower = ocr_text.lower()
+                for r in db_rows:
+                    rc = (r.get("category") or "").lower().strip()
+                    if rc and rc in ocr_lower:
+                        ai_category = rc
+                        break
             for r in db_rows:
                 s = 0.0
-                if size_norm := normalize_size(ai_result.get("size") or ai_result.get("extracted_text", "")):
+                if size_norm := normalize_size(ai_result.get("size") or ocr_text):
                     if normalize_size(r["size"]) == size_norm:
                         s += config.SIZE_EXACT_BONUS
-                brand_guess = (ai_result.get("brand") or "").lower()
                 if brand_guess and r["brand"]:
                     s += (fuzz.partial_ratio(brand_guess, r["brand"].lower()) / 100) * config.BRAND_WEIGHT
                 text_blob = " ".join(filter(None, [
                     ai_result.get("category_guess", ""),
                     ai_result.get("visual_description", ""),
-                    ai_result.get("extracted_text", ""),
+                    ocr_text,
                 ])).lower()
                 candidates_text = f"{r['vision_keywords']} {r['ocr_keywords']} {r['description']} {r['category']}".lower()
                 s += (fuzz.token_set_ratio(text_blob, candidates_text) / 100) * config.TEXT_MATCH_WEIGHT
@@ -439,30 +631,52 @@ def main():
                         s -= config.CATEGORY_MISMATCH_PENALTY
                 if vh_sku and str(r["sku"]) == str(vh_sku):
                     s += min(vh_bonus, config.VISUAL_HASH_WEIGHT)
+                if input_hash and ref_hash_map:
+                    sku_str = str(r["sku"])
+                    if sku_str in ref_hash_map:
+                        import imagehash
+                        try:
+                            ref_h = imagehash.hex_to_hash(ref_hash_map[sku_str])
+                            dist = imagehash.hex_to_hash(input_hash) - ref_h
+                            bonus = max(0, config.REF_VISUAL_WEIGHT - dist)
+                            s += min(bonus, config.REF_VISUAL_WEIGHT)
+                        except Exception:
+                            pass
                 sorted_candidates.append((r, round(s, 1)))
             sorted_candidates.sort(key=lambda x: x[1], reverse=True)
 
             if (len(sorted_candidates) >= 2
                     and sorted_candidates[0][1] - sorted_candidates[1][1] < config.VISUAL_AMBIGUITY_GAP
                     and sorted_candidates[0][1] >= config.MIN_MATCH_SCORE):
-                top_skus = [sorted_candidates[0][0], sorted_candidates[1][0]]
+                top_skus = [c[0] for c in sorted_candidates[:5]]
                 ref_paths = []
+                valid_top_skus = []
                 for ts in top_skus:
                     ts_sku = str(ts["sku"])
-                    if ts_sku in hash_cache:
-                        h = hash_cache[ts_sku]
-                        if isinstance(h, list):
-                            ref_paths.append(os.path.join(config.RENAMED_DIR, ts["output_folder"], f"{ts_sku}.jpg"))
-                        else:
-                            ref_paths.append(os.path.join(config.RENAMED_DIR, ts["output_folder"], f"{ts_sku}.jpg"))
-                if ref_paths:
-                    print(f"  -> ambiguity detected (top1={sorted_candidates[0][1]}, top2={sorted_candidates[1][1]}), Gemini compare...")
-                    best_idx = compare_with_gemini(client, path, ref_paths)
-                    if best_idx >= 0:
-                        chosen = top_skus[best_idx]
+                    ref_path = None
+                    cat_jpg = os.path.join(config.CATALOG_REF_DIR, f"{ts_sku}.jpg")
+                    cat_png = os.path.join(config.CATALOG_REF_DIR, f"{ts_sku}.png")
+                    
+                    if os.path.exists(cat_jpg):
+                        ref_path = cat_jpg
+                    elif os.path.exists(cat_png):
+                        ref_path = cat_png
+                    else:
+                        if ts_sku in hash_cache:
+                            ref_path = os.path.join(config.RENAMED_DIR, ts["output_folder"], f"{ts_sku}.jpg")
+                            
+                    if ref_path and os.path.exists(ref_path):
+                        ref_paths.append(ref_path)
+                        valid_top_skus.append(ts)
+                        
+                if len(ref_paths) >= 2:
+                    print(f"  -> membandingkan {len(ref_paths)} kandidat dengan AI visual compare...")
+                    best_idx = compare_images(path, ref_paths, client)
+                    if best_idx >= 0 and best_idx < len(valid_top_skus):
+                        chosen = valid_top_skus[best_idx]
                         row = chosen
-                        score = sorted_candidates[best_idx][1]
-                        print(f"  -> Gemini pilih: {chosen['sku']} (score {score})")
+                        score = sorted_candidates[0][1] + 10 # Bonus score for visual match
+                        print(f"  -> AI pilih secara visual: {chosen['sku']} (score {score})")
 
             if row and score >= config.MIN_MATCH_SCORE:
                 status = "OK"
