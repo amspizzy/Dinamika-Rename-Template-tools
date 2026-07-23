@@ -540,7 +540,7 @@ with tab1:
 
             new_rows.append([
                 fname, sku, row["description"] if row else "", score, status,
-                ai_raw, dest_path, "",
+                ai_raw[:300] if len(ai_raw) > 300 else ai_raw, dest_path, "",
             ])
             progress.progress((i + 1) / total)
 
@@ -589,11 +589,13 @@ with tab1:
             if not pd.notna(path) or not os.path.exists(str(path)):
                 return None
             try:
-                with open(path, "rb") as f:
-                    data = f.read()
-                ext = os.path.splitext(str(path))[1].lower()
-                mime = {"jpg": "image/jpeg", "jpeg": "image/jpeg", "png": "image/png", "webp": "image/webp"}.get(ext.lstrip("."), "image/jpeg")
-                return f"data:{mime};base64,{base64.b64encode(data).decode()}"
+                from PIL import Image, ImageOps
+                from io import BytesIO
+                img = ImageOps.exif_transpose(Image.open(str(path)))
+                img.thumbnail((150, 150))
+                buf = BytesIO()
+                img.convert("RGB").save(buf, format="JPEG", quality=70)
+                return f"data:image/jpeg;base64,{base64.b64encode(buf.getvalue()).decode()}"
             except Exception:
                 return None
 
