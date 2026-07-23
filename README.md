@@ -444,6 +444,41 @@ gambar di PDF dan mengekstraknya ke `Catalog/reference_images/`:
 Hasil: ~93% SKU berhasil dipetakan. Sisanya fallback ke `output/renamed/`.
 Jalanin ulang kalau ada SKU baru atau ganti PDF katalog.
 
+## Setup Windows
+
+### 1. Install Python
+Download Python 3.11+ dari [python.org](https://python.org) — centang **"Add Python to PATH"** saat install.
+
+### 2. Clone & setup
+```powershell
+git clone git@github.com:amspizzy/Dinamika-Rename-Template-tools.git
+cd Dinamika-Rename-Template-tools
+python -m venv .venv
+.venv\Scripts\activate
+pip install -r requirements.txt
+playwright install chromium
+```
+
+### 3. Jalankan
+```powershell
+.venv\Scripts\streamlit run app.py --server.address 0.0.0.0 --server.port 8501
+```
+
+Akses dari browser `http://localhost:8501`.
+
+### Perbedaan command dengan Linux
+| Hal | Linux | Windows |
+|-----|-------|---------|
+| Streamlit | `.venv/bin/streamlit run` | `.venv\Scripts\streamlit run` |
+| Python | `python3` | `python` |
+| Path | `/` separator | `\` separator (otomatis) |
+| EasyOCR GPU | CUDA via package manager | CUDA Toolkit + cuDNN manual |
+
+### Catatan
+- **EasyOCR GPU** di Windows butuh CUDA Toolkit + cuDNN setup manual — recommended pake CPU aja (lebih simpel)
+- **Ollama** jalan normal di Windows, download installer dari [ollama.com](https://ollama.com)
+- **cloudflared** (`trycloudflare.com`) tersedia binary `.exe`, download dari [cloudflare.com](https://developers.cloudflare.com/cloudflare-one/connections/connect-apps/install-and-setup/installation)
+
 ## Dependencies
 
 ```
