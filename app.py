@@ -242,11 +242,11 @@ with st.sidebar.expander("Folder & reset"):
         st.success("SVG/JPG lama dibersihkan.")
         st.rerun()
     if st.button("Reset scan"):
-        for path in [config.RENAMED_DIR, config.REPORT_DIR]:
+        for path in [config.RENAMED_DIR, config.REPORT_DIR, config.INPUT_DIR]:
             if os.path.exists(path):
                 shutil.rmtree(path)
         ensure_work_dirs()
-        st.success("Report dan hasil rename dibersihkan.")
+        st.success("Report, hasil rename, dan foto incoming dibersihkan.")
         st.rerun()
     if st.button("Archive output"):
         archive_root, moved = archive_current_output()
@@ -601,22 +601,25 @@ with tab1:
 
         df["_preview"] = df["final_path"].apply(_img_preview)
         show_cols = ["_preview", "original_filename", "matched_sku", "description", "score", "status"]
-        edited_df = st.data_editor(
-            df[show_cols],
-            column_config={
-                "_preview": st.column_config.ImageColumn("Foto", width="small"),
-                "original_filename": st.column_config.TextColumn("File", disabled=True),
-                "matched_sku": st.column_config.SelectboxColumn("SKU", options=sku_list),
-                "description": st.column_config.TextColumn("Deskripsi", disabled=True),
-                "score": st.column_config.NumberColumn("Skor", disabled=True),
-                "status": st.column_config.TextColumn("Status", disabled=True),
-            },
-            hide_index=True,
-            width='stretch',
-            key="sku_editor",
-        )
+        
+        with st.form("sku_form"):
+            edited_df = st.data_editor(
+                df[show_cols],
+                column_config={
+                    "_preview": st.column_config.ImageColumn("Foto", width="small"),
+                    "original_filename": st.column_config.TextColumn("File", disabled=True),
+                    "matched_sku": st.column_config.SelectboxColumn("SKU", options=sku_list),
+                    "description": st.column_config.TextColumn("Deskripsi", disabled=True),
+                    "score": st.column_config.NumberColumn("Skor", disabled=True),
+                    "status": st.column_config.TextColumn("Status", disabled=True),
+                },
+                hide_index=True,
+                width='stretch',
+                key="sku_editor",
+            )
+            submitted = st.form_submit_button("Simpan Perubahan SKU", type="primary")
 
-        if st.button("Simpan Perubahan SKU", type="primary"):
+        if submitted:
             changed_mask = edited_df["matched_sku"] != df["matched_sku"]
             changed_idxs = edited_df.index[changed_mask].tolist()
 
@@ -653,14 +656,45 @@ with tab1:
                     assigned += 1
 
                 if assigned > 0:
-                    rows_list = df.values.tolist()
+                    base_cols = ["original_filename", "matched_sku", "description", "score", "status", "ai_raw", "final_path", "primary"]
+                    rows_list = df[base_cols].values.tolist()
                     mr.mark_primary_photo(rows_list)
-                    df = pd.DataFrame(rows_list, columns=df.columns)
+                    df = pd.DataFrame(rows_list, columns=base_cols)
+                    df["_preview"] = df["final_path"].apply(_img_preview)
                     df.to_csv(config.REPORT_CSV, index=False)
                     st.success(f"{assigned} foto berhasil di-update SKU-nya!")
                     st.rerun()
                 else:
                     st.info("Tidak ada perubahan yang bisa diproses.")
+
+        st.divider()
+        st.subheader("Download hasil rename")
+
+        renamed_files = []
+        if os.path.isdir(config.RENAMED_DIR):
+            for root, dirs, files in os.walk(config.RENAMED_DIR):
+                for f in files:
+                    ext = os.path.splitext(f)[1].lower()
+                    if ext in (".jpg", ".jpeg", ".png", ".webp", ".bmp", ".heic"):
+                        full_path = os.path.join(root, f)
+                        arcname = os.path.relpath(full_path, config.RENAMED_DIR)
+                        renamed_files.append((full_path, arcname))
+
+        if renamed_files:
+            st.caption(f"Total {len(renamed_files)} foto di folder `output/renamed/`")
+            zip_buf = io.BytesIO()
+            with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
+                for full_path, arcname in renamed_files:
+                    zf.write(full_path, arcname)
+            st.download_button(
+                "⬇️ Download semua foto hasil rename (.zip)",
+                data=zip_buf.getvalue(),
+                file_name="hasil_rename.zip",
+                mime="application/zip",
+                type="primary",
+            )
+        else:
+            st.caption("Belum ada foto hasil rename.")
 
 # =============================================================== TAB 2 =====
 with tab2:
